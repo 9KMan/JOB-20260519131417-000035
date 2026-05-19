@@ -1,0 +1,266 @@
+# Manufacturing ERP Data Integration Platform — SPEC.md
+## JOB-20260519131417-000035
+
+**Stack:** Apache Airflow · dbt Core (with stored procedures) · Polars · MinIO · Azure SQL
+**Pattern:** Medallion Architecture (Bronze → Silver → Gold)
+
+---
+
+## 1. Project Overview
+
+**Client:** Manufacturing ERP Integration — Upwork
+**Goal:** Build a Medallion data pipeline that consolidates ERP data from multiple manufacturing businesses (Sage, SAP, custom ERPs) into a standardized Azure SQL data warehouse for analytics, dashboards, and reporting.
+**Stack:** Airflow DAGs, dbt Core + stored procedures, Polars ETL, MinIO (S3), Azure SQL
+**Key Domains:** Sales orders, invoices, shipments, inventory, procurement, order-to-cash workflows
+
+---
+
+## 2. Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    MULTI-ERP SOURCES                    │
+│   Sage ERP          SAP ERP          Custom ERP         │
+└────────────┬────────────────┬────────────────┬───────────┘
+             │                │                │
+             ▼                ▼                ▼
+┌─────────────────────────────────────────────────────────┐
+│         BRONZE LAYER (dbt + Stored Procedures)          │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  dbt model: bronze/stg_erp_extract.sql         │    │
+│  │  • Calls stored procedure: sp_extract_source  │    │
+│  │  • sp_extract_source reads ERP via ODBC/REST │    │
+│  │  • Returns result set → dbt seeds to Parquet  │    │
+│  │  • Watermark-based incremental CDC            │    │
+│  │  • Output: MinIO s3://factory/bronze/{src}/  │    │
+│  └─────────────────────────────────────────────────┘    │
+│  Pattern: dbt model → stored procedure → Parquet       │
+└─────────────────────────────┬──────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│             SILVER LAYER (dbt + Polars)                 │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  dbt model: silver/stg_canonical.sql            │    │
+│  │  • Reads Bronze Parquet via Polars             │    │
+│  │  • sp_deduplicate (stored procedure)           │    │
+│  │  • sp_canonical_mapping (stored procedure)     │    │
+│  │  • SCD Type 2 via dbt snapshots                │    │
+│  │  • Output: Azure SQL silver_* tables          │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────┬──────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│              GOLD LAYER (dbt Core)                      │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │  dbt model: marts/dim_*.sql                     │    │
+│  │  dbt model: marts/fact_*.sql                    │    │
+│  │  • Kimball star schema (surrogate keys)         │    │
+│  │  • sp_scd_type2 (stored procedure for dims)    │    │
+│  │  • schema.yml (unique/not_null/FK tests)        │    │
+│  │  • Incremental materialization                  │    │
+│  └─────────────────────────────────────────────────┘    │
+└─────────────────────────────┬──────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────┐
+│              CONSUMPTION LAYER                          │
+│  • SQL Views for web platform (dynamic screen render)  │
+│  • JSON config exports (workflow_config.json)           │
+│  • Azure SQL for BI/reporting tools                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Directory Structure
+
+```
+JOB-20260519131417-000035/
+├── README.md
+├── SPEC.md
+├── .gitignore
+│
+├── dbt/
+│   └── factory/
+│       ├── dbt_project.yml
+│       ├── profiles.yml
+│       ├── models/
+│       │   ├── bronze/
+│       │   │   ├── stg_sage_sales.sql        # Calls sp_extract_sage
+│       │   │   ├── stg_sap_sales.sql         # Calls sp_extract_sap
+│       │   │   └── stg_custom_sales.sql      # Calls sp_extract_custom
+│       │   ├── silver/
+│       │   │   ├── stg_sales_canonical.sql
+│       │   │   ├── stg_invoice_canonical.sql
+│       │   │   ├── stg_shipment_canonical.sql
+│       │   │   └── stg_inventory_canonical.sql
+│       │   ├── marts/
+│       │   │   ├── dim_product.sql
+│       │   │   ├── dim_customer.sql
+│       │   │   ├── dim_vendor.sql
+│       │   │   ├── dim_date.sql
+│       │   │   ├── dim_location.sql
+│       │   │   ├── fact_sales_order.sql
+│       │   │   ├── fact_inventory.sql
+│       │   │   ├── fact_procurement.sql
+│       │   │   └── fact_shipment.sql
+│       │   └── exports/
+│       │       └── json_export.sql
+│       ├── macros/
+│       │   ├── call_stored_proc.sql          # Jinja macro: {{ call_stored_proc('sp_name') }}
+│       │   └── cdc_watermark.sql             # Jinja macro for watermark logic
+│       └── tests/
+│           └── schema.yml
+│
+├── sql/
+│   └── stored_procedures/
+│       ├── sp_extract_sage.sql               # Read Sage ERP via ODBC
+│       ├── sp_extract_sap.sql                # Read SAP ERP via REST
+│       ├── sp_extract_custom.sql             # Read custom ERP
+│       ├── sp_deduplicate.sql                # Deduplicate across sources
+│       ├── sp_canonical_mapping.sql          # Map to unified schema
+│       ├── sp_scd_type2.sql                 # SCD Type 2 dimension updates
+│       └── sp_pipeline_log.sql              # Pipeline execution logging
+│
+├── json/
+│   ├── erp_sources.json                      # Source ERP connection/schema mapping
+│   └── workflow_config.json                  # Web platform workflow definitions
+│
+└── docs/
+    └── pipeline-runbook.md                    # Production support procedures
+```
+
+---
+
+## 4. Key Technical Decisions
+
+1. **Stored procedures for ERP extraction** — `sp_extract_{source}` called from dbt models; encapsulates ODBC/REST connection logic, watermark filtering, and error handling in SQL Server
+2. **dbt seeds to Parquet for Bronze** — dbt `seed` + custom materialization writes Parquet to MinIO
+3. **Stored procedures for deduplication and canonical mapping** — `sp_deduplicate`, `sp_canonical_mapping` run in Azure SQL against staging tables
+4. **dbt snapshots for SCD Type 2** — `dbt snapshot` on dimension models; stored proc `sp_scd_type2` handles the actual dimension merge
+5. **Jinja macros for stored procedure calls** — `{{ call_stored_proc('sp_name', params) }}` keeps dbt models clean
+6. **Watermark-based CDC** — `LastModified` column tracked per source; stored procedure filters by watermark
+7. **No full re-loads** — watermark is the only state; incremental everywhere
+
+---
+
+## 5. Data Model
+
+### Dimension Tables (Gold — dbt Marts)
+
+| Table | Description | SCD Type |
+|-------|-------------|----------|
+| dim_product | Product master, category, unit of measure | Type 2 |
+| dim_customer | Customer master, region, segment | Type 2 |
+| dim_vendor | Vendor master, payment terms | Type 2 |
+| dim_date | Calendar (Year, Quarter, Month, Week, Day) | Static |
+| dim_location | Warehouse/location master | Type 2 |
+
+### Fact Tables (Gold — dbt Marts)
+
+| Table | Grain | Dimensions |
+|-------|-------|------------|
+| fact_sales_order | One row per sales order line | dim_date, dim_customer, dim_product, dim_location |
+| fact_inventory | One row per inventory snapshot | dim_date, dim_product, dim_location |
+| fact_procurement | One row per PO line | dim_date, dim_vendor, dim_product |
+| fact_shipment | One row per shipment line | dim_date, dim_customer, dim_product, dim_location |
+
+### Staging Tables (Silver — Azure SQL)
+
+| Table | Description |
+|-------|-------------|
+| silver_sales_order | Canonical sales order lines |
+| silver_invoice | Canonical invoices |
+| silver_shipment | Canonical shipments |
+| silver_inventory | Canonical inventory snapshots |
+
+---
+
+## 6. Stored Procedure Design
+
+### `sp_extract_{source}` Pattern
+```sql
+CREATE PROCEDURE sp_extract_sage_sales_orders
+    @LastModified DATETIME2 OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Read from Sage ODBC linked server
+    -- Filter by watermark (only rows modified since last run)
+    -- Return result set for dbt to seed
+
+    SELECT
+        SALES_ORDER_NO AS OrderNumber,
+        CUSTOMER_ID AS CustomerKey,
+        PRODUCT_SKU AS ProductKey,
+        ORDER_DATE AS OrderDate,
+        ORDER_QTY AS Quantity,
+        @LastModified AS ExtractedAt
+    FROM [SageLink].[ERP].[SalesOrders]
+    WHERE LastModified > @LastModified;
+END
+```
+
+### `sp_scd_type2` Pattern
+```sql
+CREATE PROCEDURE sp_scd_type2_dim_product
+    @BatchId UNIQUEIDENTIFIER
+AS
+BEGIN
+    -- Insert new version, close old version
+    INSERT INTO dim_product (ProductKey, NaturalKey, Name, Category, IsCurrent, ValidFrom, ValidTo, BatchId)
+    SELECT
+        NEXT VALUE FOR dim_product_seq,
+        NaturalKey, Name, Category,
+        1, GETDATE(), NULL, @BatchId
+    FROM staging_product_updates
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dim_product p
+        WHERE p.NaturalKey = staging_product_updates.NaturalKey
+        AND p.IsCurrent = 1
+        AND p.Category = staging_product_updates.Category
+    );
+
+    -- Close old versions where category changed
+    UPDATE dim_product
+    SET IsCurrent = 0, ValidTo = GETDATE()
+    WHERE NaturalKey IN (SELECT NaturalKey FROM staging_product_updates)
+    AND IsCurrent = 1;
+END
+```
+
+---
+
+## 7. Out of Scope
+
+- BI tool selection/implementation (Power BI, Tableau)
+- Real-time streaming (Kafka, Event Hub)
+- Cloud infrastructure (Azure setup, VM management)
+- ERP customization or implementation
+- Data science / ML workloads
+
+---
+
+## 8. Success Metrics
+
+- Bronze Parquet available within 15 min of ERP change
+- Silver tables updated every 30 min, zero data loss
+- dbt test pass rate: 100% on schema.yml
+- Zero null foreign keys in fact tables
+- Pipeline SLA: 99.5% dag success rate
+
+---
+
+## 9. Deliverables
+
+| Phase | Deliverable |
+|-------|------------|
+| P1 | dbt Bronze models + stored procedures for ERP extraction |
+| P2 | Stored procedures for deduplication + canonical mapping |
+| P3 | dbt Silver + Gold models (staging + marts) |
+| P4 | SCD Type 2 via dbt snapshots + stored procs |
+| P5 | Kimball star schema (dims + facts) with schema.yml tests |
+| P6 | JSON config exports + pipeline runbook |

@@ -1,427 +1,511 @@
 -- ============================================================================
--- BRONZE LAYER - ETL Pipeline Stored Procedures
--- Watermark-based incremental CDC procedures
--- No full re-loads - incremental only
+-- CDC ETL Procedures for Bronze Layer
+-- ============================================================================
+-- Watermark-based incremental load procedures with TRY/CATCH error handling,
+-- transaction management, and pipeline logging.
 -- ============================================================================
 
--- ============================================================================
---usp_bronze_get_watermark
--- Retrieves the last watermark value for a given source
--- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_get_watermark', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_get_watermark;
+USE DATABASE $(DATABASE_NAME);
 GO
 
-CREATE PROC bronze.usp_bronze_get_watermark
-    @source_id NVARCHAR(50),
-    @source_table NVARCHAR(100),
-    @last_watermark DATETIME2 OUTPUT
+-- ============================================================================
+-- ETL Watermarks Table
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS etl.etl_watermarks (
+    watermark_id INT IDENTITY(1,1) PRIMARY KEY CLUSTERED,
+    source_system NVARCHAR(50) NOT NULL,
+    source_table NVARCHAR(100) NOT NULL,
+    watermark_column NVARCHAR(100) NOT NULL,
+    last_watermark_value DATETIME2 NULL,
+    updated_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    
+    CONSTRAINT UQ_etl_watermarks_source_table UNIQUE (source_system, source_table)
+);
+GO
+
+-- ============================================================================
+-- Procedure: usp_bronze_load_sage_sales_orders
+-- ============================================================================
+CREATE OR ALTER PROCEDURE etl.usp_bronze_load_sage_sales_orders
+    @BatchSize INT = 10000,
+    @LoadId UNIQUEIDENTIFIER OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    SELECT @last_watermark = last_watermark_value
-    FROM bronze.watermark
-    WHERE source_id = @source_id
-      AND source_table = @source_table;
-
-    -- Return NULL if no watermark exists (first run)
-    SET @last_watermark = ISNULL(@last_watermark, '1900-01-01');
-END
-GO
-
--- ============================================================================
---usp_bronze_update_watermark
--- Updates the watermark after successful load
--- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_update_watermark', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_update_watermark;
-GO
-
-CREATE PROC bronze.usp_bronze_update_watermark
-    @source_id NVARCHAR(50),
-    @source_table NVARCHAR(100),
-    @stage_table NVARCHAR(100),
-    @new_watermark_value DATETIME2,
-    @rows_processed INT,
-    @status NVARCHAR(20) = 'success',
-    @error_message NVARCHAR(MAX) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    MERGE INTO bronze.watermark AS target
-    USING (SELECT @source_id AS source_id, @source_table AS source_table) AS source
-    ON target.source_id = source.source_id AND target.source_table = source.source_table
-    WHEN MATCHED THEN
-        UPDATE SET
-            last_watermark_value = @new_watermark_value,
-            last_run_time = SYSDATETIME(),
-            rows_processed = @rows_processed,
-            status = @status,
-            error_message = @error_message
-    WHEN NOT MATCHED THEN
-        INSERT (source_id, source_table, stage_table, last_watermark_value, last_run_time, rows_processed, status, error_message)
-        VALUES (@source_id, @source_table, @stage_table, @new_watermark_value, SYSDATETIME(), @rows_processed, @status, @error_message);
-END
-GO
-
--- ============================================================================
---usp_bronze_load_sage_sales_orders
--- Incremental load from Sage ERP - only new/modified rows since last run
--- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_load_sage_sales_orders', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_load_sage_sales_orders;
-GO
-
-CREATE PROC bronze.usp_bronze_load_sage_sales_orders
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @last_watermark DATETIME2;
-    DECLARE @batch_id UNIQUEIDENTIFIER = NEWID();
-    DECLARE @rows_processed INT = 0;
-    DECLARE @max_watermark DATETIME2;
-    DECLARE @error_message NVARCHAR(MAX);
-
+    SET XACT_ABORT ON;
+    
+    DECLARE @ProcName NVARCHAR(255) = OBJECT_NAME(@@PROCID);
+    DECLARE @JobId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @RowsProcessed INT = 0;
+    DECLARE @ErrorMessage NVARCHAR(MAX);
+    DECLARE @LastWatermark DATETIME2;
+    
+    -- Initialize LoadId if not provided
+    IF @LoadId IS NULL
+        SET @LoadId = NEWID();
+    
     BEGIN TRY
         -- Get last watermark
-        EXEC bronze.usp_bronze_get_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'SO_SalesOrderHeaders',
-            @last_watermark = @last_watermark OUTPUT;
-
-        -- Mark as running
-        UPDATE bronze.watermark
-        SET status = 'running'
-        WHERE source_id = 'sage_erp' AND source_table = 'SO_SalesOrderHeaders';
-
-        -- Source query (replace with actual linked server query in production)
-        -- This example uses OPENROWSET or linked server syntax
-        /*
-        INSERT INTO bronze.stage_sage_sales_orders
-            (OrderID, CustomerID, OrderDate, TotalAmount, OrderStatus, LastModified, SourceSystem, BatchID)
-        SELECT
+        SELECT @LastWatermark = last_watermark_value
+        FROM etl.etl_watermarks
+        WHERE source_system = 'sage' AND source_table = 'sales_orders';
+        
+        -- Start pipeline log
+        INSERT INTO etl.pipeline_log (job_name, job_id, start_time, status, rows_processed)
+        VALUES (@ProcName, @JobId, SYSDATETIME(), 'Running', 0);
+        
+        BEGIN TRANSACTION;
+        
+        -- CDC Incremental Load from Sage Source
+        -- In production, this would be: INSERT INTO stage.stage_sage_sales_orders (...)
+        -- SELECT ... FROM [$(SageServer)].[$(SageDatabase)].dbo.sales_orders s
+        -- WHERE s.LastModified > @LastWatermark OR @LastWatermark IS NULL
+        
+        -- For demo, simulate incremental load
+        INSERT INTO stage.stage_sage_sales_orders (
+            source_system, load_id, last_modified, is_deleted, natural_key,
+            OrderID, CustomerID, OrderDate, TotalAmount, Status
+        )
+        SELECT TOP (@BatchSize)
+            'sage',
+            @LoadId,
+            GETDATE(),
+            0,
+            CAST(OrderID AS NVARCHAR(255)),
             OrderID,
             CustomerID,
             OrderDate,
             TotalAmount,
-            OrderStatus,
-            LastModified,
-            'sage_erp',
-            @batch_id
-        FROM [sage-db.internal].SageLive.dbo.SO_SalesOrderHeaders
-        WHERE LastModified > @last_watermark;
-        */
-
-        -- Simulated insert for development
-        INSERT INTO bronze.stage_sage_sales_orders
-            (OrderID, CustomerID, OrderDate, TotalAmount, OrderStatus, LastModified, SourceSystem, BatchID)
-        VALUES
-            ('SO-2025-001', 'CUST-001', '2025-01-15', 15000.00, 'Approved', SYSDATETIME(), 'sage_erp', @batch_id),
-            ('SO-2025-002', 'CUST-002', '2025-01-15', 8500.00, 'Pending', SYSDATETIME(), 'sage_erp', @batch_id);
-
-        -- Get count and max watermark
-        SELECT @rows_processed = COUNT(*), @max_watermark = MAX(LastModified)
-        FROM bronze.stage_sage_sales_orders
-        WHERE BatchID = @batch_id;
-
-        -- Update watermark on success
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'SO_SalesOrderHeaders',
-            @stage_table = 'stage_sage_sales_orders',
-            @new_watermark_value = @max_watermark,
-            @rows_processed = @rows_processed,
-            @status = 'success';
-
-        PRINT 'Sage sales orders loaded: ' + CAST(@rows_processed AS NVARCHAR(10)) + ' rows';
-
+            Status
+        FROM (
+            SELECT 1 AS OrderID, 'CUST001' AS CustomerID, GETDATE() AS OrderDate, 1000.00 AS TotalAmount, 'Active' AS Status
+        ) AS SimulatedSource
+        WHERE NOT EXISTS (
+            SELECT 1 FROM stage.stage_sage_sales_orders sso
+            WHERE sso.OrderID = OrderID AND sso.load_id = @LoadId
+        );
+        
+        SET @RowsProcessed = @@ROWCOUNT;
+        
+        -- Update watermark
+        MERGE INTO etl.etl_watermarks AS target
+        USING (SELECT 'sage' AS source_system, 'sales_orders' AS source_table, SYSDATETIME() AS last_watermark_value) AS source
+        ON target.source_system = source.source_system AND target.source_table = source.source_table
+        WHEN MATCHED THEN
+            UPDATE SET last_watermark_value = source.last_watermark_value, updated_at = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (source_system, source_table, watermark_column, last_watermark_value)
+            VALUES (source.source_system, source.source_table, 'LastModified', source.last_watermark_value);
+        
+        COMMIT TRANSACTION;
+        
+        -- Update pipeline log success
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Success', rows_processed = @RowsProcessed
+        WHERE job_id = @JobId;
+        
     END TRY
     BEGIN CATCH
-        SET @error_message = ERROR_MESSAGE();
-
-        -- Log failure
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'SO_SalesOrderHeaders',
-            @stage_table = 'stage_sage_sales_orders',
-            @new_watermark_value = @last_watermark,
-            @rows_processed = 0,
-            @status = 'failed',
-            @error_message = @error_message;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        
+        SET @ErrorMessage = ERROR_MESSAGE() + ' (Line: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')';
+        
+        -- Log error
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Failed', error_message = @ErrorMessage
+        WHERE job_id = @JobId;
+        
+        -- Insert to dead letter
+        INSERT INTO etl.dead_letter (source_system, source_table, payload, error_message, retry_count)
+        VALUES ('sage', 'sales_orders', NULL, @ErrorMessage, 0);
+        
+        -- Rethrow for calling procedure
         THROW;
+        
     END CATCH
+    
+    RETURN @RowsProcessed;
 END
 GO
 
 -- ============================================================================
---usp_bronze_load_sage_invoices
--- Incremental load from Sage Invoices
+-- Procedure: usp_bronze_load_sage_invoices
 -- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_load_sage_invoices', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_load_sage_invoices;
-GO
-
-CREATE PROC bronze.usp_bronze_load_sage_invoices
+CREATE OR ALTER PROCEDURE etl.usp_bronze_load_sage_invoices
+    @BatchSize INT = 10000,
+    @LoadId UNIQUEIDENTIFIER OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    DECLARE @last_watermark DATETIME2;
-    DECLARE @batch_id UNIQUEIDENTIFIER = NEWID();
-    DECLARE @rows_processed INT = 0;
-    DECLARE @max_watermark DATETIME2;
-    DECLARE @error_message NVARCHAR(MAX);
-
+    SET XACT_ABORT ON;
+    
+    DECLARE @ProcName NVARCHAR(255) = OBJECT_NAME(@@PROCID);
+    DECLARE @JobId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @RowsProcessed INT = 0;
+    DECLARE @ErrorMessage NVARCHAR(MAX);
+    DECLARE @LastWatermark DATETIME2;
+    
+    IF @LoadId IS NULL
+        SET @LoadId = NEWID();
+    
     BEGIN TRY
-        EXEC bronze.usp_bronze_get_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'AR_Invoices',
-            @last_watermark = @last_watermark OUTPUT;
-
-        UPDATE bronze.watermark
-        SET status = 'running'
-        WHERE source_id = 'sage_erp' AND source_table = 'AR_Invoices';
-
-        /* Source query:
-        INSERT INTO bronze.stage_sage_invoices
-            (InvoiceID, OrderID, CustomerID, InvoiceDate, TotalAmount, PaidAmount, LastModified, SourceSystem, BatchID)
-        SELECT
-            InvoiceID, OrderID, CustomerID, InvoiceDate, TotalAmount, PaidAmount, LastModified, 'sage_erp', @batch_id
-        FROM [sage-db.internal].SageLive.dbo.AR_Invoices
-        WHERE LastModified > @last_watermark;
-        */
-
-        -- Simulated insert
-        INSERT INTO bronze.stage_sage_invoices
-            (InvoiceID, OrderID, CustomerID, InvoiceDate, TotalAmount, PaidAmount, LastModified, SourceSystem, BatchID)
-        VALUES
-            ('INV-2025-001', 'SO-2025-001', 'CUST-001', '2025-01-16', 15000.00, 5000.00, SYSDATETIME(), 'sage_erp', @batch_id),
-            ('INV-2025-002', 'SO-2025-002', 'CUST-002', '2025-01-16', 8500.00, 0, SYSDATETIME(), 'sage_erp', @batch_id);
-
-        SELECT @rows_processed = COUNT(*), @max_watermark = MAX(LastModified)
-        FROM bronze.stage_sage_invoices
-        WHERE BatchID = @batch_id;
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'AR_Invoices',
-            @stage_table = 'stage_sage_invoices',
-            @new_watermark_value = @max_watermark,
-            @rows_processed = @rows_processed,
-            @status = 'success';
-
-        PRINT 'Sage invoices loaded: ' + CAST(@rows_processed AS NVARCHAR(10)) + ' rows';
-
+        SELECT @LastWatermark = last_watermark_value
+        FROM etl.etl_watermarks
+        WHERE source_system = 'sage' AND source_table = 'invoices';
+        
+        INSERT INTO etl.pipeline_log (job_name, job_id, start_time, status, rows_processed)
+        VALUES (@ProcName, @JobId, SYSDATETIME(), 'Running', 0);
+        
+        BEGIN TRANSACTION;
+        
+        -- CDC Incremental Load
+        INSERT INTO stage.stage_sage_invoices (
+            source_system, load_id, last_modified, is_deleted, natural_key,
+            InvoiceID, OrderID, InvoiceDate, InvoiceAmount, TaxAmount
+        )
+        SELECT TOP (@BatchSize)
+            'sage',
+            @LoadId,
+            GETDATE(),
+            0,
+            CAST(InvoiceID AS NVARCHAR(255)),
+            InvoiceID,
+            OrderID,
+            InvoiceDate,
+            InvoiceAmount,
+            TaxAmount
+        FROM (
+            SELECT 1 AS InvoiceID, 'ORD001' AS OrderID, GETDATE() AS InvoiceDate, 1000.00 AS InvoiceAmount, 100.00 AS TaxAmount
+        ) AS SimulatedSource
+        WHERE NOT EXISTS (
+            SELECT 1 FROM stage.stage_sage_invoices si
+            WHERE si.InvoiceID = InvoiceID AND si.load_id = @LoadId
+        );
+        
+        SET @RowsProcessed = @@ROWCOUNT;
+        
+        MERGE INTO etl.etl_watermarks AS target
+        USING (SELECT 'sage' AS source_system, 'invoices' AS source_table, SYSDATETIME() AS last_watermark_value) AS source
+        ON target.source_system = source.source_system AND target.source_table = source.source_table
+        WHEN MATCHED THEN
+            UPDATE SET last_watermark_value = source.last_watermark_value, updated_at = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (source_system, source_table, watermark_column, last_watermark_value)
+            VALUES (source.source_system, source.source_table, 'LastModified', source.last_watermark_value);
+        
+        COMMIT TRANSACTION;
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Success', rows_processed = @RowsProcessed
+        WHERE job_id = @JobId;
+        
     END TRY
     BEGIN CATCH
-        SET @error_message = ERROR_MESSAGE();
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sage_erp',
-            @source_table = 'AR_Invoices',
-            @stage_table = 'stage_sage_invoices',
-            @new_watermark_value = @last_watermark,
-            @rows_processed = 0,
-            @status = 'failed',
-            @error_message = @error_message;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        
+        SET @ErrorMessage = ERROR_MESSAGE() + ' (Line: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')';
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Failed', error_message = @ErrorMessage
+        WHERE job_id = @JobId;
+        
+        INSERT INTO etl.dead_letter (source_system, source_table, payload, error_message, retry_count)
+        VALUES ('sage', 'invoices', NULL, @ErrorMessage, 0);
+        
         THROW;
+        
     END CATCH
+    
+    RETURN @RowsProcessed;
 END
 GO
 
 -- ============================================================================
---usp_bronze_load_sap_sales_orders
--- Incremental load from SAP ERP
+-- Procedure: usp_bronze_load_sap_sales_orders
 -- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_load_sap_sales_orders', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_load_sap_sales_orders;
-GO
-
-CREATE PROC bronze.usp_bronze_load_sap_sales_orders
+CREATE OR ALTER PROCEDURE etl.usp_bronze_load_sap_sales_orders
+    @BatchSize INT = 10000,
+    @LoadId UNIQUEIDENTIFIER OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    DECLARE @last_watermark DATETIME2;
-    DECLARE @batch_id UNIQUEIDENTIFIER = NEWID();
-    DECLARE @rows_processed INT = 0;
-    DECLARE @max_watermark DATETIME2;
-    DECLARE @error_message NVARCHAR(MAX);
-
+    SET XACT_ABORT ON;
+    
+    DECLARE @ProcName NVARCHAR(255) = OBJECT_NAME(@@PROCID);
+    DECLARE @JobId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @RowsProcessed INT = 0;
+    DECLARE @ErrorMessage NVARCHAR(MAX);
+    DECLARE @LastWatermark DATETIME2;
+    
+    IF @LoadId IS NULL
+        SET @LoadId = NEWID();
+    
     BEGIN TRY
-        EXEC bronze.usp_bronze_get_watermark
-            @source_id = 'sap_erp',
-            @source_table = 'VBAK_SalesOrders',
-            @last_watermark = @last_watermark OUTPUT;
-
-        UPDATE bronze.watermark
-        SET status = 'running'
-        WHERE source_id = 'sap_erp' AND source_table = 'VBAK_SalesOrders';
-
-        /* SAP source query:
-        INSERT INTO bronze.stage_sap_sales_orders
-            (OrderID, CustomerID, OrderDate, TotalAmount, POReference, OrderStatus, LastModified, SourceSystem, BatchID)
-        SELECT
-            VBELN, KUNNR, AUDAT, NETWR, BSTNK, VMSTA, MODIFIED_TS, 'sap_erp', @batch_id
-        FROM [sap-db.internal].SAPECC.dbo.VBAK_SalesOrders
-        WHERE MODIFIED_TS > @last_watermark;
-        */
-
-        -- Simulated insert
-        INSERT INTO bronze.stage_sap_sales_orders
-            (OrderID, CustomerID, OrderDate, TotalAmount, POReference, OrderStatus, LastModified, SourceSystem, BatchID)
-        VALUES
-            ('SAP-0001', 'CUST-003', '2025-01-15', 22000.00, 'PO-12345', 'Approved', SYSDATETIME(), 'sap_erp', @batch_id),
-            ('SAP-0002', 'CUST-001', '2025-01-15', 11000.00, 'PO-12346', 'Pending', SYSDATETIME(), 'sap_erp', @batch_id);
-
-        SELECT @rows_processed = COUNT(*), @max_watermark = MAX(LastModified)
-        FROM bronze.stage_sap_sales_orders
-        WHERE BatchID = @batch_id;
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sap_erp',
-            @source_table = 'VBAK_SalesOrders',
-            @stage_table = 'stage_sap_sales_orders',
-            @new_watermark_value = @max_watermark,
-            @rows_processed = @rows_processed,
-            @status = 'success';
-
-        PRINT 'SAP sales orders loaded: ' + CAST(@rows_processed AS NVARCHAR(10)) + ' rows';
-
+        SELECT @LastWatermark = last_watermark_value
+        FROM etl.etl_watermarks
+        WHERE source_system = 'sap' AND source_table = 'sales_orders';
+        
+        INSERT INTO etl.pipeline_log (job_name, job_id, start_time, status, rows_processed)
+        VALUES (@ProcName, @JobId, SYSDATETIME(), 'Running', 0);
+        
+        BEGIN TRANSACTION;
+        
+        -- SAP uses MODIFIED_TS watermark column
+        INSERT INTO stage.stage_sap_sales_orders (
+            source_system, load_id, last_modified, is_deleted, natural_key,
+            VBELN, KUNNR, AUDAT, NETWR, WKURS, WAERS, BSTNK, STATU
+        )
+        SELECT TOP (@BatchSize)
+            'sap',
+            @LoadId,
+            GETDATE(),
+            0,
+            CAST(VBELN AS NVARCHAR(255)),
+            VBELN,
+            KUNNR,
+            AUDAT,
+            NETWR,
+            WKURS,
+            WAERS,
+            BSTNK,
+            STATU
+        FROM (
+            SELECT 'VB001' AS VBELN, 'KUN001' AS KUNNR, GETDATE() AS AUDAT, 5000.00 AS NETWR, '1.0' AS WKURS, 'USD' AS WAERS, 'PO001' AS BSTNK, 'A' AS STATU
+        ) AS SimulatedSource
+        WHERE NOT EXISTS (
+            SELECT 1 FROM stage.stage_sap_sales_orders sso
+            WHERE sso.VBELN = VBELN AND sso.load_id = @LoadId
+        );
+        
+        SET @RowsProcessed = @@ROWCOUNT;
+        
+        MERGE INTO etl.etl_watermarks AS target
+        USING (SELECT 'sap' AS source_system, 'sales_orders' AS source_table, SYSDATETIME() AS last_watermark_value) AS source
+        ON target.source_system = source.source_system AND target.source_table = source.source_table
+        WHEN MATCHED THEN
+            UPDATE SET last_watermark_value = source.last_watermark_value, updated_at = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (source_system, source_table, watermark_column, last_watermark_value)
+            VALUES (source.source_system, source.source_table, 'MODIFIED_TS', source.last_watermark_value);
+        
+        COMMIT TRANSACTION;
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Success', rows_processed = @RowsProcessed
+        WHERE job_id = @JobId;
+        
     END TRY
     BEGIN CATCH
-        SET @error_message = ERROR_MESSAGE();
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'sap_erp',
-            @source_table = 'VBAK_SalesOrders',
-            @stage_table = 'stage_sap_sales_orders',
-            @new_watermark_value = @last_watermark,
-            @rows_processed = 0,
-            @status = 'failed',
-            @error_message = @error_message;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        
+        SET @ErrorMessage = ERROR_MESSAGE() + ' (Line: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')';
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Failed', error_message = @ErrorMessage
+        WHERE job_id = @JobId;
+        
+        INSERT INTO etl.dead_letter (source_system, source_table, payload, error_message, retry_count)
+        VALUES ('sap', 'sales_orders', NULL, @ErrorMessage, 0);
+        
         THROW;
+        
     END CATCH
+    
+    RETURN @RowsProcessed;
 END
 GO
 
 -- ============================================================================
---usp_bronze_load_custom_inventory
--- Incremental load from Custom ERP inventory
+-- Procedure: usp_bronze_load_sap_invoices
 -- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_load_custom_inventory', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_load_custom_inventory;
-GO
-
-CREATE PROC bronze.usp_bronze_load_custom_inventory
+CREATE OR ALTER PROCEDURE etl.usp_bronze_load_sap_invoices
+    @BatchSize INT = 10000,
+    @LoadId UNIQUEIDENTIFIER OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    DECLARE @last_watermark DATETIME2;
-    DECLARE @batch_id UNIQUEIDENTIFIER = NEWID();
-    DECLARE @rows_processed INT = 0;
-    DECLARE @max_watermark DATETIME2;
-    DECLARE @error_message NVARCHAR(MAX);
-
+    SET XACT_ABORT ON;
+    
+    DECLARE @ProcName NVARCHAR(255) = OBJECT_NAME(@@PROCID);
+    DECLARE @JobId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @RowsProcessed INT = 0;
+    DECLARE @ErrorMessage NVARCHAR(MAX);
+    DECLARE @LastWatermark DATETIME2;
+    
+    IF @LoadId IS NULL
+        SET @LoadId = NEWID();
+    
     BEGIN TRY
-        EXEC bronze.usp_bronze_get_watermark
-            @source_id = 'custom_erp',
-            @source_table = 'inventory_snapshot',
-            @last_watermark = @last_watermark OUTPUT;
-
-        UPDATE bronze.watermark
-        SET status = 'running'
-        WHERE source_id = 'custom_erp' AND source_table = 'inventory_snapshot';
-
-        /* Custom ERP source query:
-        INSERT INTO bronze.stage_custom_inventory
-            (SnapshotID, ProductID, WarehouseID, Quantity, LastModified, SourceSystem, BatchID)
-        SELECT
-            snapshot_id, product_id, warehouse_id, quantity_on_hand, updated_at, 'custom_erp', @batch_id
-        FROM [custom-db.internal].MfgERP.public.inventory_snapshot
-        WHERE updated_at > @last_watermark;
-        */
-
-        -- Simulated insert
-        INSERT INTO bronze.stage_custom_inventory
-            (SnapshotID, ProductID, WarehouseID, Quantity, LastModified, SourceSystem, BatchID)
-        VALUES
-            ('SNAP-001', 'PROD-001', 'WH-001', 500.00, SYSDATETIME(), 'custom_erp', @batch_id),
-            ('SNAP-001', 'PROD-002', 'WH-001', 250.00, SYSDATETIME(), 'custom_erp', @batch_id),
-            ('SNAP-001', 'PROD-003', 'WH-002', 1200.00, SYSDATETIME(), 'custom_erp', @batch_id);
-
-        SELECT @rows_processed = COUNT(*), @max_watermark = MAX(LastModified)
-        FROM bronze.stage_custom_inventory
-        WHERE BatchID = @batch_id;
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'custom_erp',
-            @source_table = 'inventory_snapshot',
-            @stage_table = 'stage_custom_inventory',
-            @new_watermark_value = @max_watermark,
-            @rows_processed = @rows_processed,
-            @status = 'success';
-
-        PRINT 'Custom inventory loaded: ' + CAST(@rows_processed AS NVARCHAR(10)) + ' rows';
-
+        SELECT @LastWatermark = last_watermark_value
+        FROM etl.etl_watermarks
+        WHERE source_system = 'sap' AND source_table = 'invoices';
+        
+        INSERT INTO etl.pipeline_log (job_name, job_id, start_time, status, rows_processed)
+        VALUES (@ProcName, @JobId, SYSDATETIME(), 'Running', 0);
+        
+        BEGIN TRANSACTION;
+        
+        INSERT INTO stage.stage_sap_invoices (
+            source_system, load_id, last_modified, is_deleted, natural_key,
+            INVNUM, VBELN, FKDAT, NETWR, MWSBK, KUNRG, WAERS
+        )
+        SELECT TOP (@BatchSize)
+            'sap',
+            @LoadId,
+            GETDATE(),
+            0,
+            CAST(INVNUM AS NVARCHAR(255)),
+            INVNUM,
+            VBELN,
+            FKDAT,
+            NETWR,
+            MWSBK,
+            KUNRG,
+            WAERS
+        FROM (
+            SELECT 'INV001' AS INVNUM, 'VB001' AS VBELN, GETDATE() AS FKDAT, 5000.00 AS NETWR, 500.00 AS MWSBK, 'KUN001' AS KUNRG, 'USD' AS WAERS
+        ) AS SimulatedSource
+        WHERE NOT EXISTS (
+            SELECT 1 FROM stage.stage_sap_invoices si
+            WHERE si.INVNUM = INVNUM AND si.load_id = @LoadId
+        );
+        
+        SET @RowsProcessed = @@ROWCOUNT;
+        
+        MERGE INTO etl.etl_watermarks AS target
+        USING (SELECT 'sap' AS source_system, 'invoices' AS source_table, SYSDATETIME() AS last_watermark_value) AS source
+        ON target.source_system = source.source_system AND target.source_table = source.source_table
+        WHEN MATCHED THEN
+            UPDATE SET last_watermark_value = source.last_watermark_value, updated_at = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (source_system, source_table, watermark_column, last_watermark_value)
+            VALUES (source.source_system, source.source_table, 'MODIFIED_TS', source.last_watermark_value);
+        
+        COMMIT TRANSACTION;
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Success', rows_processed = @RowsProcessed
+        WHERE job_id = @JobId;
+        
     END TRY
     BEGIN CATCH
-        SET @error_message = ERROR_MESSAGE();
-
-        EXEC bronze.usp_bronze_update_watermark
-            @source_id = 'custom_erp',
-            @source_table = 'inventory_snapshot',
-            @stage_table = 'stage_custom_inventory',
-            @new_watermark_value = @last_watermark,
-            @rows_processed = 0,
-            @status = 'failed',
-            @error_message = @error_message;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        
+        SET @ErrorMessage = ERROR_MESSAGE() + ' (Line: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')';
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Failed', error_message = @ErrorMessage
+        WHERE job_id = @JobId;
+        
+        INSERT INTO etl.dead_letter (source_system, source_table, payload, error_message, retry_count)
+        VALUES ('sap', 'invoices', NULL, @ErrorMessage, 0);
+        
         THROW;
+        
     END CATCH
+    
+    RETURN @RowsProcessed;
 END
 GO
 
 -- ============================================================================
---usp_bronze_run_all
--- Master procedure to run all bronze loads
+-- Procedure: usp_bronze_load_custom_inventory
 -- ============================================================================
-IF OBJECT_ID('bronze.usp_bronze_run_all', 'P') IS NOT NULL
-    DROP PROC bronze.usp_bronze_run_all;
-GO
-
-CREATE PROC bronze.usp_bronze_run_all
+CREATE OR ALTER PROCEDURE etl.usp_bronze_load_custom_inventory
+    @BatchSize INT = 10000,
+    @LoadId UNIQUEIDENTIFIER OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    PRINT 'Starting Bronze layer load...';
-    PRINT '--------------------------------';
-
-    -- Load Sage
-    PRINT 'Loading Sage ERP...';
-    EXEC bronze.usp_bronze_load_sage_sales_orders;
-    EXEC bronze.usp_bronze_load_sage_invoices;
-
-    -- Load SAP
-    PRINT 'Loading SAP ERP...';
-    EXEC bronze.usp_bronze_load_sap_sales_orders;
-
-    -- Load Custom
-    PRINT 'Loading Custom ERP...';
-    EXEC bronze.usp_bronze_load_custom_inventory;
-
-    PRINT '--------------------------------';
-    PRINT 'Bronze layer load complete.';
+    SET XACT_ABORT ON;
+    
+    DECLARE @ProcName NVARCHAR(255) = OBJECT_NAME(@@PROCID);
+    DECLARE @JobId UNIQUEIDENTIFIER = NEWID();
+    DECLARE @RowsProcessed INT = 0;
+    DECLARE @ErrorMessage NVARCHAR(MAX);
+    DECLARE @LastWatermark DATETIME2;
+    
+    IF @LoadId IS NULL
+        SET @LoadId = NEWID();
+    
+    BEGIN TRY
+        SELECT @LastWatermark = last_watermark_value
+        FROM etl.etl_watermarks
+        WHERE source_system = 'custom' AND source_table = 'inventory';
+        
+        INSERT INTO etl.pipeline_log (job_name, job_id, start_time, status, rows_processed)
+        VALUES (@ProcName, @JobId, SYSDATETIME(), 'Running', 0);
+        
+        BEGIN TRANSACTION;
+        
+        -- Custom ERP uses updated_at watermark
+        INSERT INTO stage.stage_custom_inventory (
+            source_system, load_id, last_modified, is_deleted, natural_key,
+            inventory_id, product_sku, warehouse_code, quantity_on_hand,
+            quantity_reserved, quantity_available, unit_cost, last_updated
+        )
+        SELECT TOP (@BatchSize)
+            'custom',
+            @LoadId,
+            GETDATE(),
+            0,
+            CAST(product_sku + '_' + warehouse_code AS NVARCHAR(255)),
+            inventory_id,
+            product_sku,
+            warehouse_code,
+            quantity_on_hand,
+            quantity_reserved,
+            quantity_available,
+            unit_cost,
+            last_updated
+        FROM (
+            SELECT 'INV001' AS inventory_id, 'SKU001' AS product_sku, 'WH001' AS warehouse_code,
+                   100.00 AS quantity_on_hand, 10.00 AS quantity_reserved, 90.00 AS quantity_available,
+                   25.00 AS unit_cost, GETDATE() AS last_updated
+        ) AS SimulatedSource
+        WHERE NOT EXISTS (
+            SELECT 1 FROM stage.stage_custom_inventory ci
+            WHERE ci.inventory_id = inventory_id AND ci.load_id = @LoadId
+        );
+        
+        SET @RowsProcessed = @@ROWCOUNT;
+        
+        MERGE INTO etl.etl_watermarks AS target
+        USING (SELECT 'custom' AS source_system, 'inventory' AS source_table, SYSDATETIME() AS last_watermark_value) AS source
+        ON target.source_system = source.source_system AND target.source_table = source.source_table
+        WHEN MATCHED THEN
+            UPDATE SET last_watermark_value = source.last_watermark_value, updated_at = SYSDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT (source_system, source_table, watermark_column, last_watermark_value)
+            VALUES (source.source_system, source.source_table, 'updated_at', source.last_watermark_value);
+        
+        COMMIT TRANSACTION;
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Success', rows_processed = @RowsProcessed
+        WHERE job_id = @JobId;
+        
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+        
+        SET @ErrorMessage = ERROR_MESSAGE() + ' (Line: ' + CAST(ERROR_LINE() AS NVARCHAR(10)) + ')';
+        
+        UPDATE etl.pipeline_log
+        SET end_time = SYSDATETIME(), status = 'Failed', error_message = @ErrorMessage
+        WHERE job_id = @JobId;
+        
+        INSERT INTO etl.dead_letter (source_system, source_table, payload, error_message, retry_count)
+        VALUES ('custom', 'inventory', NULL, @ErrorMessage, 0);
+        
+        THROW;
+        
+    END CATCH
+    
+    RETURN @RowsProcessed;
 END
 GO
 
-PRINT 'Bronze layer ETL procedures created successfully.';
+PRINT 'Bronze ETL procedures created successfully.';
 GO

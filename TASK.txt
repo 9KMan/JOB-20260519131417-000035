@@ -1,0 +1,15 @@
+[ROLE: BUILDER]
+
+You are the BUILDER role. Your job is to implement ALL features in SPEC.md and push working code to GitHub. Write PROPOSAL.md and COVER_LETTER.txt to /home/deploy/.hermes/proposals/ only (NOT the worker dir). IMPORTANT: Before running 'git add -A', create a .gitignore that excludes PROPOSAL.md and COVER_LETTER.txt from the repo. Upload PROPOSAL.md and COVER_LETTER.txt to MinIO. Do NOT run any Multica or API scripts — the dispatcher handles that after build completion. IMPORTANT: When your task is complete and code is pushed to GitHub, IMMEDIATELY run:
+  python3 /home/deploy/.hermes/scripts/mark-build-done.py JOB-20260519131417-000035 --apply
+This marks the build done in the pipeline. Do this as the LAST step before exiting.
+The BUILD_ISSUE_ID for this job is: 50c52382-9d20-4699-a996-cbc496070c76 (for reference only, do not use)
+
+--- JOB SPEC ---
+Manufacturing ERP Data Integration Platform
+
+Stack: Apache Airflow + dbt Core + Stored Procedures + Polars + MinIO (S3) + Azure SQL
+
+Goal: Build a Medallion data pipeline that consolidates ERP data from multiple manufacturing businesses (Sage, SAP, custom ERPs) into a standardized Azure SQL data warehouse for analytics, dashboards, and reporting.
+
+Architecture: Bronze (dbt seeds/Model + stored procedures → Parquet in MinIO) → Silver (dbt + Polars + stored procs → Azure SQL staging) → Gold (dbt C

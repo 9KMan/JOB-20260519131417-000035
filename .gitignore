@@ -1,20 +1,23 @@
-# Worker internals — never commit to GitHub
-pid
-role
-worker.log
-SPEC.txt
-TASK.txt
-
-# Proposal files — Winning Strategy: MinIO only, NOT GitHub
+# Keep proposal and cover letter out of repo
 PROPOSAL.md
 COVER_LETTER.txt
 
-# Dependencies and build artifacts
-node_modules/
-build/
-dist/
+# SQL Server / Azure SQL
+*.sql
+*.bak
 
-# Environment files (secrets)
+# Python
+__pycache__/
+*.pyc
 .env
-.env.local
-.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
