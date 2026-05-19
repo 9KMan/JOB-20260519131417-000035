@@ -1,0 +1,184 @@
+-- ============================================================================
+-- ERP Sources Configuration
+-- Defines all ERP source connections, watermark columns, and column mappings
+-- Adding a new ERP source = edit this file, not the SQL
+-- ============================================================================
+{
+  "erp_sources": [
+    {
+      "source_id": "sage_erp",
+      "source_name": "Sage ERP",
+      "connection": {
+        "server": "sage-db.internal",
+        "database": "SageLive",
+        "schema": "dbo",
+        "auth_type": "windows_integrated"
+      },
+      "watermark_column": "LastModified",
+      "watermark_table": "watermark_sage",
+      "tables": [
+        {
+          "source_table": "SO_SalesOrderHeaders",
+          "stage_table": "stage_sage_sales_orders",
+          "stage_columns": {
+            "OrderID": "OrderID",
+            "CustomerID": "CustomerID",
+            "OrderDate": "OrderDate",
+            "TotalAmount": "TotalAmount",
+            "OrderStatus": "OrderStatus",
+            "LastModified": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["OrderID"],
+          "cdc_enabled": true
+        },
+        {
+          "source_table": "AR_Invoices",
+          "stage_table": "stage_sage_invoices",
+          "stage_columns": {
+            "InvoiceID": "InvoiceID",
+            "OrderID": "OrderID",
+            "CustomerID": "CustomerID",
+            "InvoiceDate": "InvoiceDate",
+            "TotalAmount": "TotalAmount",
+            "PaidAmount": "PaidAmount",
+            "LastModified": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["InvoiceID"],
+          "cdc_enabled": true
+        },
+        {
+          "source_table": "INV_Shipments",
+          "stage_table": "stage_sage_shipments",
+          "stage_columns": {
+            "ShipmentID": "ShipmentID",
+            "OrderID": "OrderID",
+            "CustomerID": "CustomerID",
+            "ShipDate": "ShipDate",
+            "Carrier": "Carrier",
+            "TrackingNumber": "TrackingNumber",
+            "LastModified": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["ShipmentID"],
+          "cdc_enabled": true
+        }
+      ]
+    },
+    {
+      "source_id": "sap_erp",
+      "source_name": "SAP ERP",
+      "connection": {
+        "server": "sap-db.internal",
+        "database": "SAPECC",
+        "schema": "dbo",
+        "auth_type": "sql_auth",
+        "username": "etl_user"
+      },
+      "watermark_column": "MODIFIED_TS",
+      "watermark_table": "watermark_sap",
+      "tables": [
+        {
+          "source_table": "VBAK_SalesOrders",
+          "stage_table": "stage_sap_sales_orders",
+          "stage_columns": {
+            "VBELN": "OrderID",
+            "KUNNR": "CustomerID",
+            "AUDAT": "OrderDate",
+            "NETWR": "TotalAmount",
+            "BSTNK": "POReference",
+            "VMSTA": "OrderStatus",
+            "MODIFIED_TS": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["OrderID"],
+          "cdc_enabled": true
+        },
+        {
+          "source_table": "VBRK_Invoices",
+          "stage_table": "stage_sap_invoices",
+          "stage_columns": {
+            "VBELN": "InvoiceID",
+            "AUBEL": "OrderID",
+            "KUNNR": "CustomerID",
+            "FKDAT": "InvoiceDate",
+            "NETWR": "TotalAmount",
+            "WIKWIR": "PaidAmount",
+            "MODIFIED_TS": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["InvoiceID"],
+          "cdc_enabled": true
+        },
+        {
+          "source_table": "LIKP_Shipments",
+          "stage_table": "stage_sap_shipments",
+          "stage_columns": {
+            "VBELN": "ShipmentID",
+            "VGBEL": "OrderID",
+            "KUNNR": "CustomerID",
+            "WADAT": "ShipDate",
+            "TLNAM": "Carrier",
+            "TKNUM": "TrackingNumber",
+            "MODIFIED_TS": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["ShipmentID"],
+          "cdc_enabled": true
+        }
+      ]
+    },
+    {
+      "source_id": "custom_erp",
+      "source_name": "Custom Manufacturing ERP",
+      "connection": {
+        "server": "custom-db.internal",
+        "database": "MfgERP",
+        "schema": "public",
+        "auth_type": "windows_integrated"
+      },
+      "watermark_column": "updated_at",
+      "watermark_table": "watermark_custom",
+      "tables": [
+        {
+          "source_table": "sales_orders",
+          "stage_table": "stage_custom_sales_orders",
+          "stage_columns": {
+            "id": "OrderID",
+            "customer_id": "CustomerID",
+            "order_date": "OrderDate",
+            "total": "TotalAmount",
+            "status": "OrderStatus",
+            "updated_at": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["OrderID"],
+          "cdc_enabled": true
+        },
+        {
+          "source_table": "inventory_snapshot",
+          "stage_table": "stage_custom_inventory",
+          "stage_columns": {
+            "snapshot_id": "SnapshotID",
+            "product_id": "ProductID",
+            "warehouse_id": "WarehouseID",
+            "quantity_on_hand": "Quantity",
+            "updated_at": "LastModified",
+            "SourceSystem": "SourceSystem"
+          },
+          "primary_key": ["SnapshotID", "ProductID", "WarehouseID"],
+          "cdc_enabled": true
+        }
+      ]
+    }
+  ],
+  "pipeline_defaults": {
+    "batch_size": 10000,
+    "max_retries": 3,
+    "retry_delay_seconds": 60,
+    "dead_letter_queue": "etl_dead_letter",
+    "alert_on_failure": true,
+    "notification_email": "etl-alerts@company.com"
+  }
+}
